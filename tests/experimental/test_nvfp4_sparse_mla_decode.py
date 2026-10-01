@@ -53,6 +53,7 @@ SM_SCALE = 1.0 / math.sqrt(HEAD_DIM)
 TOLERANCE = 1e-2
 # One-wave cluster capacity measured on GB200 (152 SMs): clusters of c CTAs that run at once.
 GB200_CAPACITY = {8: 15, 6: 23, 5: 28, 4: 36, 3: 46}
+B300_CAPACITY = {8: 15, 6: 22, 5: 26, 4: 33, 3: 45, 2: 74}
 
 
 def _is_supported_gpu() -> bool:
@@ -193,7 +194,41 @@ def test_plan_respects_ring_depth():
 
 
 @pytest.mark.parametrize(
-    "topk, num_ctas", [(2048, 2), (2048, 9), (2000, 8), (0, 4), (4096, 3)]
+    "num_tokens, expected",
+    [
+        (15, 8),
+        (20, 6),
+        (25, 5),
+        (33, 4),
+        (34, 3),
+        (45, 3),
+        (46, 5),
+        (52, 5),
+        (53, 2),
+        (74, 2),
+        (75, 5),
+        (80, 3),
+        (100, 5),
+        (120, 2),
+        (140, 2),
+        (160, 4),
+    ],
+)
+def test_b300_plan_accounts_for_whole_waves(num_tokens, expected):
+    assert select_num_ctas(num_tokens, 2048, B300_CAPACITY) == expected
+
+
+@pytest.mark.parametrize("topk", [512, 1024])
+def test_short_topk_retains_original_plan(topk):
+    without_two = {c: n for c, n in B300_CAPACITY.items() if c != 2}
+    for tokens in (1, 20, 46, 75, 160):
+        assert select_num_ctas(tokens, topk, B300_CAPACITY) == select_num_ctas(
+            tokens, topk, without_two
+        )
+
+
+@pytest.mark.parametrize(
+    "topk, num_ctas", [(2048, 1), (2048, 9), (2000, 8), (0, 4), (4096, 3)]
 )
 def test_invalid_configs(topk, num_ctas):
     assert not is_valid_config(topk, num_ctas)
@@ -225,12 +260,49 @@ def test_topk_512(kv_cache, num_tokens):
 
 
 @requires_sm100
-@pytest.mark.parametrize("num_ctas", [3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("num_ctas", [2, 3, 4, 5, 6, 7, 8])
 def test_explicit_cluster_sizes(kv_cache, num_ctas):
     q = make_query(12, seed=5)
     idx = make_indices(12, 2048, "scattered", seed=6)
     ref = reference(q, kv_cache, idx, SM_SCALE, 1.0)
     out = _decode(q, kv_cache, idx, SM_SCALE, num_ctas_per_token=num_ctas)
+    assert relative_error(out, ref) < TOLERANCE
+
+
+@requires_sm100
+@pytest.mark.parametrize("num_tokens", [1, 46, 74, 75, 140])
+@pytest.mark.parametrize("topk", [512, 1024, 2048])
+def test_two_ctas_padding_scales_and_graph(kv_cache, num_tokens, topk):
+    q = make_query(num_tokens, seed=19)
+    idx = make_indices(num_tokens, topk, "scattered", seed=20)
+    idx[0] = -1
+    if num_tokens > 1:
+        idx[1, 1:] = -1
+    out = torch.empty(
+        num_tokens, NUM_HEADS, V_HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    )
+
+    def run():
+        return _decode(
+            q,
+            kv_cache,
+            idx,
+            0.5 * SM_SCALE,
+            bmm2_scale=2.0,
+            out=out,
+            num_ctas_per_token=2,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    # Change graph inputs in place: an empty row becomes valid after capture.
+    idx[0] = torch.arange(topk, dtype=torch.int32, device="cuda")
+    graph.replay()
+    torch.cuda.synchronize()
+    ref = reference(q, kv_cache, idx, 0.5 * SM_SCALE, 2.0)
+    assert torch.isfinite(out).all()
     assert relative_error(out, ref) < TOLERANCE
 
 
@@ -309,4 +381,4 @@ def test_rejects_bad_inputs(kv_cache):
     with pytest.raises(ValueError, match="kv_cache"):
         _decode(q, kv_cache[:, :320].contiguous(), idx, SM_SCALE)
     with pytest.raises(ValueError, match="num_ctas_per_token"):
-        _decode(q, kv_cache, idx, SM_SCALE, num_ctas_per_token=2)
+        _decode(q, kv_cache, idx, SM_SCALE, num_ctas_per_token=1)

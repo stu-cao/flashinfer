@@ -177,6 +177,7 @@ __device__ __forceinline__ uint32_t hmul2_u32(uint32_t a, __half2 s) {
   return *reinterpret_cast<uint32_t*>(&x);
 }
 
+template <int C>
 __global__ void __launch_bounds__(THREADS, 1)
     nvfp4_sparse_mla_decode_kernel(const uint8_t* __restrict__ kv, const uint8_t* __restrict__ q,
                                    const int32_t* __restrict__ topk,
@@ -195,8 +196,7 @@ __global__ void __launch_bounds__(THREADS, 1)
                                             SM_IDX + SM_MB + SM_RECVO);  // [C][H][2]
 
   cg::cluster_group cluster = cg::this_cluster();
-  const int C = cluster.num_blocks(), rank = cluster.block_rank(), t = blockIdx.x / C,
-            BPC = (DV / 8 + C - 1) / C;
+  const int rank = cluster.block_rank(), t = blockIdx.x / C, BPC = (DV / 8 + C - 1) / C;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, c = lane & 3;
   const int nst_total = topk_width / SUB, s0 = (rank * nst_total) / C,
             s1 = ((rank + 1) * nst_total) / C;
@@ -452,20 +452,44 @@ inline bool is_valid_config(int topk_width, int num_ctas) {
 
 // Opt the kernel into its dynamic shared memory once per device (cudaFuncSetAttribute is per
 // device).
-inline cudaError_t ensure_kernel_attributes() {
+// Specializing the cluster size removes runtime division and modulo from the
+// stage partition and distributed merge, and lets the compiler trim the merge.
+inline auto kernel_for_cluster(int num_ctas) -> decltype(&nvfp4_sparse_mla_decode_kernel<2>) {
+  switch (num_ctas) {
+    case 2:
+      return nvfp4_sparse_mla_decode_kernel<2>;
+    case 3:
+      return nvfp4_sparse_mla_decode_kernel<3>;
+    case 4:
+      return nvfp4_sparse_mla_decode_kernel<4>;
+    case 5:
+      return nvfp4_sparse_mla_decode_kernel<5>;
+    case 6:
+      return nvfp4_sparse_mla_decode_kernel<6>;
+    case 7:
+      return nvfp4_sparse_mla_decode_kernel<7>;
+    case 8:
+      return nvfp4_sparse_mla_decode_kernel<8>;
+    default:
+      return nullptr;
+  }
+}
+
+inline cudaError_t ensure_kernel_attributes(int num_ctas) {
   constexpr int kMaxDevices = 64;
-  static int status[kMaxDevices] =
+  static int status[kMaxDevices][MAXC + 1] =
       {};  // 0: not set yet, 1: set, other: 2 + the cudaError_t it failed with
   int device = 0;
   cudaError_t e = cudaGetDevice(&device);
   if (e != cudaSuccess) return e;
   if (device < 0 || device >= kMaxDevices) return cudaErrorInvalidDevice;
-  if (status[device] == 0) {
-    e = cudaFuncSetAttribute(nvfp4_sparse_mla_decode_kernel,
+  if (status[device][num_ctas] == 0) {
+    e = cudaFuncSetAttribute(kernel_for_cluster(num_ctas),
                              cudaFuncAttributeMaxDynamicSharedMemorySize, SM_TOTAL);
-    status[device] = (e == cudaSuccess) ? 1 : 2 + static_cast<int>(e);
+    status[device][num_ctas] = (e == cudaSuccess) ? 1 : 2 + static_cast<int>(e);
   }
-  return status[device] == 1 ? cudaSuccess : static_cast<cudaError_t>(status[device] - 2);
+  return status[device][num_ctas] == 1 ? cudaSuccess
+                                       : static_cast<cudaError_t>(status[device][num_ctas] - 2);
 }
 
 inline cudaError_t launch(const uint8_t* kv, const uint8_t* q, const int32_t* indices,
@@ -473,7 +497,7 @@ inline cudaError_t launch(const uint8_t* kv, const uint8_t* q, const int32_t* in
                           float output_scale, int num_ctas, cudaStream_t stream) {
   if (num_tokens <= 0) return cudaSuccess;
   if (!is_valid_config(topk_width, num_ctas)) return cudaErrorInvalidValue;
-  cudaError_t e = ensure_kernel_attributes();
+  cudaError_t e = ensure_kernel_attributes(num_ctas);
   if (e != cudaSuccess) return e;
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3(num_tokens * num_ctas);
@@ -487,7 +511,7 @@ inline cudaError_t launch(const uint8_t* kv, const uint8_t* q, const int32_t* in
   attr[0].val.clusterDim.z = 1;
   cfg.attrs = attr;
   cfg.numAttrs = 1;
-  return cudaLaunchKernelEx(&cfg, nvfp4_sparse_mla_decode_kernel, kv, q, indices, out, topk_width,
+  return cudaLaunchKernelEx(&cfg, kernel_for_cluster(num_ctas), kv, q, indices, out, topk_width,
                             sm_scale_log2, output_scale);
 }
 
@@ -495,8 +519,8 @@ inline cudaError_t launch(const uint8_t* kv, const uint8_t* q, const int32_t* in
 // many query tokens runs in one wave.
 inline cudaError_t max_active_clusters(int num_ctas, int* count) {
   *count = 0;
-  if (num_ctas < 1 || num_ctas > MAXC) return cudaErrorInvalidValue;
-  cudaError_t e = ensure_kernel_attributes();
+  if (num_ctas < 2 || num_ctas > MAXC) return cudaErrorInvalidValue;
+  cudaError_t e = ensure_kernel_attributes(num_ctas);
   if (e != cudaSuccess) return e;
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3(num_ctas * 64);
@@ -510,7 +534,7 @@ inline cudaError_t max_active_clusters(int num_ctas, int* count) {
   cfg.attrs = attr;
   cfg.numAttrs = 1;
   return cudaOccupancyMaxActiveClusters(
-      count, reinterpret_cast<void*>(nvfp4_sparse_mla_decode_kernel), &cfg);
+      count, reinterpret_cast<void*>(kernel_for_cluster(num_ctas)), &cfg);
 }
 
 }  // namespace nvfp4_sparse_mla_decode

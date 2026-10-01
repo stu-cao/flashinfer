@@ -4750,8 +4750,9 @@ def nvfp4_sparse_mla_decode(
     out : Optional[torch.Tensor]
         ``[num_tokens, 16, 512]`` ``torch.bfloat16`` output; allocated when omitted.
     num_ctas_per_token : Optional[int]
-        Thread-block cluster size per query token, 3 to 8. By default, the largest size whose ``num_tokens``
-        clusters all fit on the device in one wave.
+        Thread-block cluster size per query token, 2 to 8. By default, chosen from device occupancy.
+        On B300 with top-k 2048, the plan compares work across whole launch waves;
+        other configurations use the largest size that fits in one wave.
     backend : str
         ``"cuda"``, the only backend.
 

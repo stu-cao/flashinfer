@@ -33,8 +33,8 @@ MAX_KEYS_PER_CTA = 1024
 RING_SLOTS = 3
 # Cluster sizes the automatic plan considers, largest first. 7 fits no more clusters per wave than 8.
 PLAN_CTAS = (8, 6, 5, 4, 3)
-# Cluster sizes accepted from callers: the ones validated on GB200 and B300 (2 fits the kernel but was never validated).
-VALID_CTAS = range(3, 9)
+# The two-CTA path is additionally validated on B300; SM100 retains its existing automatic plan.
+VALID_CTAS = range(2, 9)
 LOG2E = math.log2(math.e)
 # Compute capability -> the architecture-specific target the kernel is built for.
 ARCH_BY_COMPUTE_CAPABILITY = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
@@ -68,15 +68,26 @@ def is_valid_config(topk_width: int, num_ctas: int) -> bool:
 
 
 def select_num_ctas(num_tokens: int, topk_width: int, capacity: Dict[int, int]) -> int:
-    """The largest valid cluster size whose ``num_tokens`` clusters fit on the device in one wave.
+    """Choose a cluster size from occupancy and the work per CTA.
 
-    ``capacity[c]`` is the number of ``c``-CTA clusters the device runs at once. When no size fits in one wave,
-    the smallest valid size is used and the launch runs in several waves.
+    For B300's validated top-k 2048 workload, compare whole launch waves, including
+    the two-CTA path. Other configurations retain the largest-one-wave plan.
     """
     valid = [c for c in PLAN_CTAS if is_valid_config(topk_width, c)]
     if not valid:
         raise ValueError(
             f"NVFP4 sparse MLA decode does not support topk_width={topk_width}"
+        )
+    if topk_width == 2048 and capacity.get(2, 0) > 0:
+        # The loop walks ceil(stages / c) stages per CTA; pipeline fill and merge
+        # add about three stage times on B300. Counting whole waves avoids both
+        # the 46-token cliff and always choosing C=2 when it needs another wave.
+        stages = topk_width // STAGE_KEYS
+        candidates = [c for c in (*valid, 2) if capacity.get(c, 0) > 0]
+        return min(
+            candidates,
+            key=lambda c: -(-num_tokens // capacity[c])
+            * (-(-stages // c) + RING_SLOTS),
         )
     for c in valid:
         if num_tokens <= capacity.get(c, 0):
@@ -86,9 +97,11 @@ def select_num_ctas(num_tokens: int, topk_width: int, capacity: Dict[int, int]) 
 
 @functools.cache
 def _capacity(device_index: int) -> Dict[int, int]:
-    module = get_module(device_arch(device_index))
+    arch = device_arch(device_index)
+    module = get_module(arch)
     with torch.cuda.device(device_index):
-        return {c: int(module.max_active_clusters(c)) for c in PLAN_CTAS}
+        sizes = (*PLAN_CTAS, 2) if arch == "sm_103a" else PLAN_CTAS
+        return {c: int(module.max_active_clusters(c)) for c in sizes}
 
 
 def _check_inputs(
