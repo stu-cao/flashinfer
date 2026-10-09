@@ -1323,6 +1323,7 @@ class MoeAlltoAll:
         expert_id_payload_index: Optional[int] = None,
         eplb_local_stats: Optional[torch.Tensor] = None,
         active_rank_mask: Optional[torch.Tensor] = None,
+        enable_pdl: Optional[bool] = None,
     ) -> list[torch.Tensor]:
         r"""Run the MoE all-to-all dispatch phase.
 
@@ -1353,6 +1354,12 @@ class MoeAlltoAll:
             :func:`moe_a2a_active_rank_mask`).  Tokens routed to a masked-off rank are
             dropped instead of hanging the collective.  Requires the instance to have
             been constructed with ``enable_rank_mask=True``.
+        enable_pdl : bool, optional
+            Whether to launch the dispatch kernel with programmatic dependent
+            launch; forwarded to :func:`moe_a2a_dispatch`.  ``None`` (default)
+            auto-detects from the device.  Pass ``False`` when the kernel that
+            precedes the dispatch on the stream is not PDL-safe.  The
+            ``invalid_token_expert_id`` sanitize kernel keeps the device default.
 
         Returns
         -------
@@ -1391,6 +1398,7 @@ class MoeAlltoAll:
             self.ep_size,
             self.top_k,
             self.num_experts,
+            enable_pdl=enable_pdl,
             eplb_local_stats=eplb_local_stats,
             enable_rank_mask=self.enable_rank_mask,
             active_rank_mask=active_rank_mask,
