@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import functools
+import os
 import threading
 import weakref
 from dataclasses import dataclass
@@ -22,6 +24,7 @@ from types import SimpleNamespace
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     ClassVar,
     Dict,
     List,
@@ -53,7 +56,9 @@ from ..autotuner import (
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
+    _tactic_to_json_hashable,
 )
+from ..autotuner.autotuner import _is_device_oom
 from ..jit import (
     setup_cubin_loader,
 )
@@ -114,6 +119,134 @@ from .utils import (
 
 if TYPE_CHECKING:
     from flashinfer.fused_moe.da_config import TrtllmDaConfig
+
+
+def _moe_oom_guard_enabled() -> bool:
+    """Whether ``FLASHINFER_MOE_OOM_GUARD=1`` opts into the MoE OOM guard.
+
+    When enabled, a device OOM in the fixed-tactic launch of
+    ``trtllm_fp4_block_scale_moe`` falls back to the default tactic and
+    demotes the tactic for that shape instead of propagating.  Unset (or any
+    other value) keeps the unguarded launch.
+    """
+    return os.environ.get("FLASHINFER_MOE_OOM_GUARD", "0") == "1"
+
+
+def _clear_cuda_state_after_oom() -> None:
+    # A failed allocation can leave a sticky CUDA error that would surface
+    # during a later CUDA graph capture; only cudaGetLastError() clears it.
+    # empty_cache() is illegal during capture (the graph pool owns the failed
+    # allocation there), so skip it then.
+    with contextlib.suppress(Exception):
+        torch.cuda.synchronize()
+    with contextlib.suppress(Exception):
+        torch.cuda.cudart().cudaGetLastError()
+    if not torch.cuda.is_current_stream_capturing():
+        torch.cuda.empty_cache()
+
+
+def _demote_oom_tactic(
+    tuner: AutoTuner,
+    custom_op: str,
+    runner: TunableRunner,
+    tuning_config: TuningConfig,
+    inputs: List[Any],
+    tactic: Any,
+) -> None:
+    """Make the default tactic the winner for this shape after ``tactic`` OOMed.
+
+    Records the tactic in the failed-tactics statistics (input to the offline
+    blocklist generator), stores tactic ``-1`` in the in-memory winner cache,
+    and drops the file-sourced entry and the profiling policy.  Serving then
+    uses the default tactic for this shape and never retries the OOMing one;
+    the next ``save_configs`` persists the default.  In tuning mode the
+    dropped policy makes ``choose_one`` re-profile the shape, where the
+    memory probe (``FLASHINFER_AUTOTUNE_MEM_PROBE``) can pick a tactic that
+    fits.  Best effort: never raises.
+    """
+    try:
+        tuner.stats.failed_tactics.setdefault(
+            f"{custom_op}::{runner.__class__.__name__}", set()
+        ).add(_tactic_to_json_hashable(tactic))
+        cache_key = AutoTuner._get_cache_key(
+            custom_op,
+            runner,
+            tuner._get_input_sizes(inputs),
+            tuning_config,
+            runner.get_cache_key_extras(inputs),
+        )
+        winners = tuner._winner_cache()
+        stored = winners.get(cache_key)
+        winners[cache_key] = (-1, stored[1] if stored else None)
+        tuner._profiling_cache_policies.pop(cache_key, None)
+        tuner._file_configs.pop(cache_key.file_key, None)
+        tuner._dirty = True
+        # Bump the sequence so a save that snapshotted before this demotion
+        # does not clear the dirty flag.
+        tuner._dirty_seq += 1
+    except Exception:
+        logger.debug("[MoeOOMGuard]: failed to record the OOMed tactic", exc_info=True)
+
+
+def _launch_moe_with_oom_guard(
+    launch: Callable[[Any], List[torch.Tensor]],
+    tactic: Any,
+    *,
+    tuner: AutoTuner,
+    custom_op: str,
+    runner: TunableRunner,
+    tuning_config: TuningConfig,
+    inputs: List[Any],
+    num_tokens: int,
+) -> List[torch.Tensor]:
+    """Run ``launch(tactic)``; on a device OOM fall back to the default tactic.
+
+    Workspace allocations inside the trtllm-gen MoE launcher go through
+    tvm-ffi, which reports an allocator failure as a plain ``MemoryError``,
+    so a tuned tactic whose workspace fit while profiling (served from the
+    allocator's pool) can still fail at its first real call.  A tuned tactic
+    that OOMs is demoted for this shape (``_demote_oom_tactic``) and the call
+    is retried with the default tactic.  If the default tactic itself OOMs
+    the error is logged and re-raised: a caller such as a boot autotune
+    warmup can skip that shape, and at serving time it is a genuine capacity
+    exhaustion, as without the guard.
+    """
+    demoted = None
+    if tactic != -1:
+        try:
+            return launch(tactic)
+        except Exception as e:
+            if not _is_device_oom(e):
+                raise
+            _clear_cuda_state_after_oom()
+            logger.warning(
+                "[MoeOOMGuard]: tactic %s for %s OOMed (%s, shape num_tokens=%d); "
+                "falling back to the default tactic and demoting it for this "
+                "shape.",
+                tactic,
+                custom_op,
+                type(e).__name__,
+                num_tokens,
+            )
+        # Retry outside the except block so the failed attempt's exception
+        # and frames are released before the default tactic allocates.
+        _demote_oom_tactic(tuner, custom_op, runner, tuning_config, inputs, tactic)
+        demoted = tactic
+    try:
+        return launch(-1)
+    except Exception as e:
+        if not _is_device_oom(e):
+            raise
+        _clear_cuda_state_after_oom()
+        logger.warning(
+            "[MoeOOMGuard]: default tactic (-1) for %s OOMed (%s, shape "
+            "num_tokens=%d)%s; re-raising.",
+            custom_op,
+            type(e).__name__,
+            num_tokens,
+            f" after demoting tactic {demoted!r}" if demoted is not None else "",
+        )
+        raise
 
 
 # RoutingInputMode (the FusedMoE launcher's routing-input ABI enum) lives in
@@ -3576,7 +3709,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             **runner_kwargs,
         )
 
-        def run_selected_tactic(tactic: Any) -> List[torch.Tensor]:
+        def _launch_fp4_moe(tactic: Any) -> List[torch.Tensor]:
             """Launch the unchanged monolithic FP4 operation with one fixed tactic."""
             intermediate_output = moe_op.trtllm_fp4_block_scale_moe(
                 routing_input_mode,
@@ -3631,6 +3764,21 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 do_finalize,
                 gemm1_lora_delta,
                 topk_weights,
+            )
+
+        def run_selected_tactic(tactic: Any) -> List[torch.Tensor]:
+            """Launch with one fixed tactic, OOM-guarded if FLASHINFER_MOE_OOM_GUARD=1."""
+            if not _moe_oom_guard_enabled():
+                return _launch_fp4_moe(tactic)
+            return _launch_moe_with_oom_guard(
+                _launch_fp4_moe,
+                tactic,
+                tuner=tuner,
+                custom_op="flashinfer::trtllm_fp4_block_scale_moe",
+                runner=moe_runner,
+                tuning_config=tuning_config,
+                inputs=moe_inputs.to_list(),
+                num_tokens=num_tokens,
             )
 
         # When do_finalize=False, the FC2 output format is determined on device based on runtime

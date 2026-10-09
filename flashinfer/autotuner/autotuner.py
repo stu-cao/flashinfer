@@ -2,6 +2,7 @@ import bisect
 import contextlib
 import copy
 import functools
+import gc
 import hashlib
 import importlib
 import inspect
@@ -1177,6 +1178,18 @@ def _sync_oom_across_tune_group(local_oom: bool) -> bool:
     oom_flag = torch.tensor([int(local_oom)], dtype=torch.int32, device=device)
     dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX, group=_tune_process_group)
     return bool(oom_flag.item())
+
+
+def _is_device_oom(exc: BaseException) -> bool:
+    """Return whether ``exc`` is a device out-of-memory error.
+
+    tvm-ffi reports a torch allocator failure inside a kernel launcher as a
+    plain ``MemoryError``; some torch paths raise a ``RuntimeError`` whose
+    message says "CUDA out of memory".
+    """
+    if isinstance(exc, (torch.cuda.OutOfMemoryError, MemoryError)):
+        return True
+    return isinstance(exc, RuntimeError) and "cuda out of memory" in str(exc).lower()
 
 
 @dataclass(frozen=True)
@@ -2399,6 +2412,19 @@ class AutoTuner:
                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
                         runner_id, tactic = None, None
                         skipped_count = 0
+                        # Opt-in memory-aware tactic filter; None (no
+                        # change) unless FLASHINFER_AUTOTUNE_MEM_PROBE=1
+                        # and this profile is in scope.
+                        probe_state = self._mem_probe_state(p)
+                        probe_rejected = 0
+                        if probe_state is not None:
+                            logger.info(
+                                f"[Autotuner]: [MemProbe] profiling {custom_op} "
+                                f"shapes={p.get_opt_shapes()} with memory budget "
+                                f"{probe_state[1] / (1024**3):.2f} GiB (driver free "
+                                f"{probe_state[2] / (1024**3):.2f} GiB minus "
+                                f"margin)."
+                            )
                         for r_id, r in enumerate(runners):
                             runner_preparation_oom = False
                             try:
@@ -2442,6 +2468,27 @@ class AutoTuner:
                                 return runners[0], -1
 
                             for tac in valid_tactics:
+                                probe_rejected_tactic = (
+                                    probe_state is not None
+                                    and tac != -1
+                                    and self._mem_probe_rejects(
+                                        custom_op,
+                                        r,
+                                        tensors,
+                                        tac,
+                                        p,
+                                        probe_state,
+                                        **kwargs,
+                                    )
+                                )
+                                if (
+                                    probe_rejected_tactic
+                                    and _tune_process_group is None
+                                ):
+                                    # Nothing to keep in lockstep: skip the
+                                    # profile pass of an oversized tactic.
+                                    probe_rejected += 1
+                                    continue
                                 try:
                                     time_measured = self._profile_single_kernel(
                                         r,
@@ -2519,6 +2566,21 @@ class AutoTuner:
                                     # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
                                     # or some runtime error occurs during profiling.
                                     time_measured = float("inf")
+                                if probe_state is not None:
+                                    # With a tune group the profile pass ran
+                                    # on every rank; vote once per tactic so a
+                                    # reject on any rank rejects it on all
+                                    # (no divergent winners).  probe_state is
+                                    # rank-uniform, so the vote count is too.
+                                    probe_rejected_tactic = _sync_oom_across_tune_group(
+                                        probe_rejected_tactic
+                                    )
+                                    if probe_rejected_tactic:
+                                        # An oversized tactic must not win
+                                        # even if its profile succeeded from
+                                        # the allocator's cached pool.
+                                        probe_rejected += 1
+                                        time_measured = float("inf")
                                 if time_measured < min_time:
                                     min_time = time_measured
                                     runner_id, tactic = r_id, tac
@@ -2560,6 +2622,39 @@ class AutoTuner:
                             logger.debug(
                                 f"[Autotuner]: profiling chosen runner: {runners[runner_id]} {tactic} for {cache_key}"
                             )
+                        elif probe_rejected > 0:
+                            # Every tactic was rejected by the memory probe
+                            # (or failed): pin the default tactic for this
+                            # shape so later calls hit the winner cache
+                            # instead of probing and profiling again.
+                            cache_key = AutoTuner._get_cache_key(
+                                custom_op,
+                                runners[0],
+                                p.get_opt_shapes(),
+                                tuning_config,
+                                runners[0].get_cache_key_extras(tensors),
+                            )
+                            self._winner_cache()[cache_key] = (-1, p)
+                            self._profiling_cache_policies[cache_key] = (
+                                self._profiling_policy(tuning_config)
+                            )
+                            self._dirty = True
+                            self._dirty_seq += 1
+                            logger.info(
+                                f"[Autotuner]: [MemProbe] no tactic for "
+                                f"{custom_op} fits the memory budget at "
+                                f"shapes={p.get_opt_shapes()} (rejected "
+                                f"{probe_rejected}); pinned default "
+                                f"tactic=-1 for this shape."
+                            )
+                        if probe_state is not None:
+                            # Free this in-scope (large) profile's synthetic
+                            # tensors and return the cached segments to the
+                            # driver, so the next profile's budget (driver
+                            # free minus margin) is measured on a clean pool.
+                            tensors = None
+                            prepared_input_batches = None
+                            self._release_mem_probe_residue(p)
 
                 except (torch.cuda.OutOfMemoryError, MemoryError):
                     torch.cuda.empty_cache()
@@ -2737,6 +2832,159 @@ class AutoTuner:
         return tuple(
             tuple(tensor.size()) if isinstance(tensor, torch.Tensor) else (0,)
             for tensor in inputs
+        )
+
+    def _mem_probe_state(
+        self, profile: OptimizationProfile
+    ) -> Optional[tuple[int, int, int]]:
+        """Return the memory-probe budget for ``profile``, or ``None`` when off.
+
+        Opt-in memory-aware tactic filter for very large tuning buckets.  A
+        tactic can profile successfully because its workspace is served from
+        the caching allocator's pool, then fail to allocate the same
+        workspace at serving time; on the tvm-ffi path that surfaces as a
+        plain ``MemoryError`` deep inside the model forward.  The filter runs
+        each candidate tactic once eagerly, measures its peak allocation, and
+        disqualifies tactics that do not fit.
+
+        Environment (read on every profile):
+
+        - ``FLASHINFER_AUTOTUNE_MEM_PROBE``: ``"1"`` enables the filter.
+          Any other value, or unset, disables it and tuning is unchanged.
+        - ``FLASHINFER_AUTOTUNE_MEM_PROBE_MIN_SHAPE``: only profiles whose
+          largest input row count (dim 0) is above this value are probed.
+          Default ``0``.  Callers set it to the largest bucket they already
+          tune safely so those buckets keep their selection and cache keys.
+        - ``FLASHINFER_AUTOTUNE_MEM_PROBE_MARGIN_GIB``: headroom kept free.
+          The budget is driver-free memory minus this margin.  Default ``4``.
+
+        With a process group set via :func:`set_autotune_process_group`,
+        these variables must be identical on every rank: an in-scope profile
+        adds one all-reduce per tactic.
+
+        Returns ``(max_rows, budget_bytes, free_bytes)`` for an in-scope
+        profile, else ``None``.
+        """
+        if os.environ.get("FLASHINFER_AUTOTUNE_MEM_PROBE", "0") != "1":
+            return None
+        try:
+            min_shape = int(
+                os.environ.get("FLASHINFER_AUTOTUNE_MEM_PROBE_MIN_SHAPE", "0")
+            )
+        except ValueError:
+            min_shape = 0
+        # Gate on the row count (dim 0), not on any width: padding grows the
+        # token dimension only, while static widths (hidden size, vocab) can
+        # exceed MIN_SHAPE on wide models without any allocation risk.
+        max_rows = 0
+        for shape in profile.get_opt_shapes():
+            if shape and isinstance(shape[0], int) and shape[0] > max_rows:
+                max_rows = shape[0]
+        if max_rows <= min_shape:
+            return None
+        try:
+            margin_gib = float(
+                os.environ.get("FLASHINFER_AUTOTUNE_MEM_PROBE_MARGIN_GIB", "4.0")
+            )
+        except ValueError:
+            margin_gib = 4.0
+        free_bytes, _total = torch.cuda.mem_get_info()
+        return (
+            max_rows,
+            max(free_bytes - int(margin_gib * (1024**3)), 0),
+            free_bytes,
+        )
+
+    def _probe_tactic_memory(
+        self, runner: TunableRunner, inputs: list[Any], tactic: Any, **kwargs
+    ) -> int:
+        """Run one tactic eagerly; return its peak allocation delta in bytes.
+
+        Mirrors serving (no CUDA graph, no measurement scope), so the delta is
+        what every serving call of this tactic at these shapes must afford.
+        """
+        torch.cuda.synchronize()
+        base = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        runner(inputs, tactic=tactic, **kwargs)
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_allocated() - base
+
+    def _mem_probe_rejects(
+        self,
+        custom_op: str,
+        runner: TunableRunner,
+        inputs: list[Any],
+        tactic: Any,
+        profile: OptimizationProfile,
+        probe_state: tuple[int, int, int],
+        **kwargs,
+    ) -> bool:
+        """Probe ``tactic``; return True (and record it) if it does not fit.
+
+        A tactic whose probe peak exceeds the budget, or that runs out of
+        memory during the probe, is rejected.  Any other probe failure leaves
+        the verdict to the regular profile pass, which already handles
+        failing tactics.  Never raises for a failing tactic, so ranks of a
+        tune group stay in lockstep.
+        """
+        _, budget_bytes, free_bytes = probe_state
+        peak_bytes = None
+        try:
+            peak_bytes = self._probe_tactic_memory(runner, inputs, tactic, **kwargs)
+        except Exception as e:
+            # Clear the sticky CUDA error a failed launch can leave behind so
+            # it does not surface during a later CUDA graph capture.
+            with contextlib.suppress(Exception):
+                torch.cuda.synchronize()
+            with contextlib.suppress(Exception):
+                torch.cuda.cudart().cudaGetLastError()
+            with contextlib.suppress(Exception):
+                torch.cuda.empty_cache()
+            if not _is_device_oom(e):
+                logger.debug(
+                    f"[Autotuner]: [MemProbe] probe of tactic {tactic!r} for "
+                    f"{custom_op} failed ({type(e).__name__}: {e}); leaving "
+                    f"the verdict to the profile pass."
+                )
+                return False
+        if peak_bytes is not None and peak_bytes <= budget_bytes:
+            return False
+
+        self.stats.failed_tactics.setdefault(
+            f"{custom_op}::{runner.__class__.__name__}", set()
+        ).add(_tactic_to_json_hashable(tactic))
+        gib = 1024**3
+        if peak_bytes is None:
+            logger.info(
+                f"[Autotuner]: [MemProbe] tactic {tactic!r} for {custom_op} "
+                f"OOMed during its memory probe at "
+                f"shapes={profile.get_opt_shapes()}; disqualified."
+            )
+        else:
+            logger.info(
+                f"[Autotuner]: [MemProbe] rejecting tactic {tactic!r} for "
+                f"{custom_op} at shapes={profile.get_opt_shapes()}: probe peak "
+                f"{peak_bytes / gib:.2f} GiB exceeds the memory budget "
+                f"{budget_bytes / gib:.2f} GiB (driver free "
+                f"{free_bytes / gib:.2f} GiB minus margin); disqualified."
+            )
+        return True
+
+    @staticmethod
+    def _release_mem_probe_residue(profile: OptimizationProfile) -> None:
+        """Collect garbage and empty the allocator cache after a probed profile."""
+        gc.collect()
+        if not torch.cuda.is_current_stream_capturing():
+            torch.cuda.empty_cache()
+        try:
+            free_gib = f"{torch.cuda.mem_get_info()[0] / (1024**3):.2f} GiB"
+        except Exception:
+            free_gib = "unavailable"
+        logger.info(
+            f"[Autotuner]: [MemProbe] big-bucket profile "
+            f"{profile.get_opt_shapes()} done; freed synthetic tensors and "
+            f"emptied the allocator cache (driver free {free_gib})."
         )
 
     def _profile_single_kernel(
